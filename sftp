@@ -1,0 +1,21 @@
+downloader = SFTPSyncer(
+    hostname=SFTP_HOSTNAME,    # sftp-20d3c.rshift.jp
+    port=SFTP_PORT,            # 9122
+    username=SFTP_USERNAME,    # nlmtke8v.rshift.jp
+    private_key=PRIVATE_KEY,   # ~/.ssh/... via PRIVATE_KEY_PATH
+    passphrase=SFTP_PASSPHRASE,
+    password=SFTP_PASSWORD,
+    host_key=SFTP_HOST_KEY,
+)
+# 1. Configure AWS credentials (if not already done)
+aws configure
+# Enter: AWS Access Key ID, Secret Access Key, Region (ap-northeast-1), output format (json)
+
+# 2. Download the entire R202509/ prefix
+aws s3 sync s3://nssol-jp-ap-northeast-1-shift-ai-s3-store-stg/R202509/ \
+    /opt/shiftai/shiftai-time-table-model/R202509/ \
+    --region ap-northeast-1
+
+# 3. Verify the download
+aws s3 ls s3://nssol-jp-ap-northeast-1-shift-ai-s3-store-stg/R202509/ --recursive | wc -l
+find /opt/shiftai/shiftai-time-table-model/R202509 -type f | wc -l
