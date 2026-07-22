@@ -1,0 +1,9 @@
+downloader = SFTPSyncer(
+    hostname=SFTP_HOSTNAME,    # sftp-20d3c.rshift.jp
+    port=SFTP_PORT,            # 9122
+    username=SFTP_USERNAME,    # nlmtke8v.rshift.jp
+    private_key=PRIVATE_KEY,   # ~/.ssh/... via PRIVATE_KEY_PATH
+    passphrase=SFTP_PASSPHRASE,
+    password=SFTP_PASSWORD,
+    host_key=SFTP_HOST_KEY,
+)
