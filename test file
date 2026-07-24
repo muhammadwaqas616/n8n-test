@@ -1,0 +1,11 @@
+. Fill in the token details
+Note: give it a clear label, e.g. n8n-bot-pr-author — this just helps you identify it later in the token list, it has no functional effect
+Expiration: choose a duration — 30 or 90 days is reasonable for testing; you can also pick "No expiration" but GitHub will nag you about it being less secure. For a workflow you'll keep running long-term, 90 days with a calendar reminder to rotate is a good middle ground
+Select scopes: this is the important part. Check the box next to:
+✅ repo (this is the top-level checkbox — checking it automatically includes all its sub-scopes: repo:status, repo_deployment, public_repo, repo:invite, security_events)
+You don't need any other scopes (like admin:org or workflow) for this use case — just repo gives the bot enough access to clone, push, and open pull requests.
+5. Generate and copy
+Scroll down, click Generate token
+GitHub will show the token exactly once, in a green box, starting with ghp_...
+Copy it immediately and paste it somewhere safe temporarily (a password manager, or a local note you'll delete after pasting it into n8n/your terminal). If you navigate away or refresh without copying it, you cannot retrieve it again — you'd have to generate a new one.
+This is your BOT_TOKEN — used in the gi
