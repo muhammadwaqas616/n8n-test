@@ -1,0 +1,310 @@
+import datetime
+import logging
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from pydantic import BaseModel, ConfigDict, field_validator
+
+import config
+from data.hourly_sales_target import HourlySalesTarget
+from data.peak import Peak
+from engine import CannotAssignmentError, TimeTableMaker
+from inout.reader import create_read_context
+from logging_setup import setup_logging
+
+_logger = logging.getLogger(__name__)
+
+_API_DATE_FORMAT = "%Y-%m-%d"
+_API_TIME_FORMAT = "%H:%M"
+
+
+def _api_date_serializer(v: datetime.date) -> str:
+    return v.strftime(_API_DATE_FORMAT)
+
+
+def _api_time_serializer(v: datetime.time) -> str:
+    return v.strftime(_API_TIME_FORMAT)
+
+
+_API_JSON_ENCODERS = {
+    datetime.date: _api_date_serializer,
+    datetime.time: _api_time_serializer,
+}
+
+_API_MODEL_CONFIG = ConfigDict(json_encoders=_API_JSON_ENCODERS, frozen=True)
+
+
+class TimeRange(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    start: datetime.time
+    end: datetime.time
+
+    @field_validator("start", "end", mode="before")
+    @staticmethod
+    def validate_time(v: Any) -> datetime.time:
+        if isinstance(v, datetime.time):
+            return v
+        if v == "24:00":
+            return datetime.time(0, 0)
+        if not isinstance(v, str):
+            raise ValueError("時間指定は文字列である必要があります")  # noqa: TRY004
+        return datetime.datetime.strptime(v, _API_TIME_FORMAT).time()
+
+
+class FixDetail(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    time: TimeRange
+    position: str
+
+
+class Employee(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    work_start_date: datetime.date
+    employment_code: str
+    required_staff: int = 0
+    work: TimeRange
+    fix: list[FixDetail] = []
+    help: bool = False
+
+    @field_validator("work_start_date", mode="before")
+    @staticmethod
+    def validate_date(v: Any) -> datetime.date:
+        if isinstance(v, datetime.date):
+            return v
+        if not isinstance(v, str):
+            raise ValueError("日付指定は文字列である必要があります")  # noqa: TRY004
+        return datetime.datetime.strptime(v, _API_DATE_FORMAT).date()
+
+    @field_validator("employment_code")
+    @staticmethod
+    def validate_employment_code(v: str) -> str:
+        reason = None
+        int_code = None
+
+        try:
+            int_code = int(v)
+        except ValueError as e:
+            reason = e
+        if reason or int_code not in _EMPLOYMENT_CODES:
+            raise ValueError("無効な雇用形態コードです") from reason
+        return v
+
+
+class Request(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    store_code: str
+    target_date: datetime.date
+    shift: dict[str, Employee]
+
+    @field_validator("target_date", mode="before")
+    @staticmethod
+    def validate_date(v: Any) -> datetime.date:
+        if isinstance(v, datetime.date):
+            return v
+        if not isinstance(v, str):
+            raise ValueError("日付指定は文字列である必要があります")  # noqa: TRY004
+        return datetime.datetime.strptime(v, _API_DATE_FORMAT).date()
+
+    @field_validator("shift")
+    @staticmethod
+    def validate_shift_keys(v: dict[str, Employee]) -> dict[str, Employee]:
+        if "" in v:
+            raise ValueError("社員番号に空文字は許可されません")
+        return v
+
+
+class TimeAssignment(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    time: TimeRange
+    position: str
+    work_kind: int
+
+
+class Response(BaseModel):
+    model_config = _API_MODEL_CONFIG
+
+    store_code: str
+    target_date: datetime.date
+    assign: dict[str, list[TimeAssignment]]
+    peak: list[int]
+    target_amount: dict[str, int]
+
+
+_EMPLOYMENT_CODES = {
+    1: "ｴﾘｱﾃﾞｨﾚｸﾀｰ",
+    2: "ｽﾄｱﾃﾞｨﾚｸﾀｰ",
+    3: "ﾄﾚｰﾅｰ",
+    4: "ｸﾘｴｰﾀｰ",
+    5: "ｸﾘｴｰﾀｰ(時短)",
+    6: "ｸﾘｴｰﾀｰ(契約)",
+    7: "ｸﾘｴｰﾀｰ(準社員)",
+    8: "ｸﾘｴｰﾀｰ(ﾊﾟｰﾄ)",
+    9: "ｸﾘｴｰﾀｰ(準社員時短)",
+    10: "ｽﾄｱﾃﾞｨﾚｸﾀｰ(時短)",
+    11: "ｸﾘｴｰﾀｰ(ﾊﾟｰﾄ30育児)",  # TODO:この表記正しいか？-に表記ゆれがありそう
+    12: "派遣社員",
+}
+
+_tt_maker: TimeTableMaker
+_sales_target: HourlySalesTarget
+
+
+def reload():
+    global _tt_maker, _sales_target  # noqa: PLW0603
+    executor = ThreadPoolExecutor()
+    try:
+        f_sales_target = executor.submit(HourlySalesTarget, create_read_context(config.HOURLY_SALES_TARGET_DATA))
+        _tt_maker = TimeTableMaker(executor)
+        _sales_target = f_sales_target.result()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _request_obj_to_df(req: Request):
+    shifts = {}
+    fixes = []
+    for emp_code, emp in req.shift.items():
+        emp_type = _EMPLOYMENT_CODES[int(emp.employment_code)]
+        shifts[emp_code] = [
+            emp.work.start,
+            emp.work.end,
+            emp.work_start_date,
+            emp_type,
+            emp.required_staff,
+            emp.help,
+        ]
+        fixes.extend([emp_code, fix.time.start, fix.time.end, fix.position] for fix in emp.fix)
+
+    shift_df = pd.DataFrame.from_dict(
+        shifts,
+        orient="index",
+        columns=[
+            "start",
+            "end",
+            "勤務開始日",
+            "雇用形態",
+            "必要人員",
+            "応援シフト",
+        ],
+    )
+    shift_df["従業員コード"] = shift_df.index
+    shift_df["start_td"] = pd.to_timedelta(shift_df["start"].astype(str))
+    shift_df["end_td"] = pd.to_timedelta(shift_df["end"].astype(str))
+    shift_df["end_td"] = shift_df["end_td"].where(
+        shift_df["start_td"] < shift_df["end_td"], shift_df["end_td"] + pd.Timedelta(days=1)
+    )
+    shift_df = shift_df.reset_index(drop=True)
+    fix_pos_df = pd.DataFrame(fixes, columns=["従業員コード", "start", "end", "pos"])
+    fix_pos_df["start_td"] = pd.to_timedelta(fix_pos_df["start"].astype(str))
+    fix_pos_df["end_td"] = pd.to_timedelta(fix_pos_df["end"].astype(str))
+    return shift_df, fix_pos_df
+
+
+def _remove_fix_time(assigns: list[TimeAssignment], fixes: list[FixDetail]) -> list[TimeAssignment]:
+    """リクエスト時に設定されている固定作業の時間を割り当てられたタイムテーブルから除去する。
+
+    Parameters
+    ----------
+    assigns : list[TimeAssignment]
+        割り当てられた作業時間のリスト
+    fixes : list[FixDetail]
+        固定作業のリスト
+    """
+    rewrite = []
+    for fix in fixes:
+        for ta in assigns:
+            start = ta.time.start
+            end = ta.time.end
+            if fix.time.start <= ta.time.start < fix.time.end:
+                if ta.time.end <= fix.time.end:
+                    continue
+                start = fix.time.end
+                end = ta.time.end
+            elif ta.time.start < fix.time.start < ta.time.end:
+                if fix.time.end < ta.time.end:
+                    rewrite.append(
+                        TimeAssignment(
+                            time=TimeRange(start=ta.time.start, end=fix.time.start),
+                            position=ta.position,
+                            work_kind=ta.work_kind,
+                        )
+                    )
+                    start = fix.time.end
+                    end = ta.time.end
+                else:
+                    start = ta.time.start
+                    end = fix.time.start
+            rewrite.append(
+                TimeAssignment(
+                    time=TimeRange(start=start, end=end),
+                    position=ta.position,
+                    work_kind=ta.work_kind,
+                )
+            )
+    return rewrite
+
+
+def create_timetable(req_json: str | Request) -> BaseModel:
+    req = Request.model_validate_json(req_json) if isinstance(req_json, str) else req_json
+
+    if req.store_code not in _tt_maker.assignable_shops(req.target_date):
+        raise CannotAssignmentError(f"日付'{req.target_date}'で店舗'{req.store_code}'は割り当てできません")
+
+    shift_df, fix_pos_df = _request_obj_to_df(req)
+
+    # TODO: fix_pos_dfの重なりやshift_dfからのはみだしがないか確認すべき
+    tt_df, peak_df = _tt_maker.make_time_table(req.store_code, req.target_date, shift_df, fix_pos_df)
+    assignments = {}
+    if not tt_df.empty:
+        # ここは日付は（夏時間切り替わりタイミングとかの特殊な日を除けば）なんでもよいがせっかくなのでリクエストの日付を使う
+        base = datetime.datetime.combine(req.target_date, datetime.time.min)
+        tt_df["start"] = tt_df["start_td"] + base
+        tt_df["end"] = tt_df["end_td"] + base
+        for emp_code, group in tt_df.groupby("従業員コード", as_index=False):
+            assigns = [
+                TimeAssignment(
+                    time=TimeRange(start=start.time(), end=end.time()),
+                    position=str(pos),
+                    work_kind=work_kind,
+                )
+                for start, end, pos, work_kind in group[["start", "end", "実作業コード", "作業種別"]].itertuples(
+                    index=False
+                )
+            ]
+            assert isinstance(emp_code, str)
+            shift = req.shift.get(emp_code)
+            if shift:
+                if 0 < len(shift.fix):
+                    assigns = _remove_fix_time(assigns, shift.fix)
+            else:
+                # あり得ないはずの現象で本来チェックの必要もないが、固定シフト除去のついでにチェックしておく
+                _logger.warning("リクエストにない従業員コードが割り当てられています: %s", emp_code)
+            assignments[emp_code] = assigns
+
+    opening, closing, _ = _tt_maker.work_time(req.store_code, req.target_date)
+    closed_hour = (closing + pd.Timedelta(minutes=45)).components.hours
+    target_amount = _sales_target.daily(req.store_code, req.target_date)
+    target_amount = {hour: target_amount.get(hour, 0) for hour in range(opening.components.hours, closed_hour)}
+    return Response(
+        store_code=req.store_code,
+        target_date=req.target_date,
+        assign=assignments,
+        peak=Peak.to_list(peak_df),
+        target_amount={f"{hour:02}": amount for hour, amount in target_amount.items()},
+    )
+
+
+if __name__ == "__main__":
+    setup_logging()
+    reload()
+    test_input = Path(sys.argv[1]).read_text(encoding="utf-8")
+    ret = create_timetable(test_input)
+    print(ret.model_dump_json(indent=2))
