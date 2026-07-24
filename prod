@@ -1,0 +1,373 @@
+import datetime
+import json
+import logging
+import os
+import sys
+from datetime import date
+from urllib.parse import unquote, urlparse
+
+import boto3
+import numpy as np
+import pandas as pd
+import polars as pl
+
+import config as tt_config
+import tuning.tuning_config as config
+from data.event import Event
+from inout.reader import create_read_context
+from inout.util import split_uri
+from inout.writer import create_uploader
+from integrate_revised_time_table import create_table_for_overwrite, merge_files, upload_dataframe_as_csv
+from logging_setup import setup_logging
+from tuning.syncer import SFTPSyncer
+
+setup_logging()
+_logger = logging.getLogger(__name__)
+
+_SHOP_CODE = "店コード"
+_EMPLOYEE_CODE = "従業員コード"
+_DATE_COLUMN = "日付"
+_EVENT_DATE = "EVENT_DATE"
+_DATE_CATEGORY = "分類"
+_POSITION = "pos"
+_POSITION_IN_PREPROCESS_FILE = "役割"
+_POS = ["受付", "会計", "測定", "加工", "お渡し", "ホール", "プレFT"]
+_COUNT_TOTAL = "count_合計"
+_COUNT_TASK = "count_target"
+_TASK_RATIO = "割合"
+_MANUAL_SKILLED_POS_REQUIRED_COLS = ["店コード", "従業員コード", "pos", "分類"]
+
+
+def merge_manual_settings(auto_df: pd.DataFrame) -> pd.DataFrame:
+    """自動抽出された固定ポジションリストに、手動設定(CSV)の内容をマージする"""
+    try:
+        manual_ctx = create_read_context(config.MANUAL_SKILLED_POS_INPUT)
+        files = manual_ctx.list()
+
+        if not files:
+            _logger.info("固定ポジションリスト手動設定用CSVが存在しないため、自動抽出リストをそのまま使用します。")
+            return auto_df
+
+        manual_file_uri = manual_ctx.uri(files[0])
+        manual_df = pd.read_csv(manual_file_uri, dtype=str)
+        _logger.info("固定ポジションリスト手動設定用CSVを読み込みました: %s", manual_file_uri)
+
+        missing_cols = [col for col in _MANUAL_SKILLED_POS_REQUIRED_COLS if col not in manual_df.columns]
+        if missing_cols:
+            _logger.info("手動設定CSVのフォーマットエラー。不足カラム: %s。自動リストのみで続行します。", missing_cols)
+            return auto_df
+
+        # 4つの必須項目のうち、1つでも空欄(NaN)になっている行はスキップ
+        before_len = len(manual_df)
+        manual_df = manual_df.dropna(subset=_MANUAL_SKILLED_POS_REQUIRED_COLS)
+        skipped = before_len - len(manual_df)
+        if skipped > 0:
+            _logger.info("手動設定CSVに空欄を含む無効な行が %d 件ありました。スキップします。", skipped)
+
+        # 文字列の前後の空白（スペース）を削除して綺麗にする
+        manual_df["pos"] = manual_df["pos"].str.strip()
+        manual_df["分類"] = manual_df["分類"].str.strip()
+
+        # 想定外の値が入っている行を特定（変数をインライン化して削減）
+        invalid_mask = (~manual_df["pos"].isin(config.TASKS_TO_OVERWRITE)) | (
+            ~manual_df["分類"].isin(["平日", "土日祝", "全日"])
+        )
+        invalid_count = invalid_mask.sum()
+        if invalid_count > 0:
+            _logger.info(
+                "手動設定CSVに不正な値（posまたは分類の誤字）が %d 件ありました。該当行をスキップします。",
+                invalid_count,
+            )
+            # 正常な行だけを残す
+            manual_df = manual_df[~invalid_mask]
+
+        if manual_df.empty:
+            _logger.info("有効な手動設定データが0件だったため、自動抽出リストをそのまま使用します。")
+            return auto_df
+
+        # 1. 「全日」の展開処理（assignを使って一時変数を削減）
+        allday_df = manual_df[manual_df["分類"] == "全日"]
+        if not allday_df.empty:
+            manual_df = manual_df[manual_df["分類"] != "全日"]
+
+            # assignを使って直接「分類」を書き換えながら結合
+            manual_df = pd.concat(
+                [manual_df, allday_df.assign(分類="平日"), allday_df.assign(分類="土日祝")], ignore_index=True
+            )
+
+        # 2. 自動リストに合わせるためのダミー値
+        manual_df[_COUNT_TOTAL] = 100
+        manual_df[_COUNT_TASK] = 100
+        manual_df[_TASK_RATIO] = 1.0
+
+        manual_df = manual_df[[*_MANUAL_SKILLED_POS_REQUIRED_COLS, _COUNT_TOTAL, _COUNT_TASK, _TASK_RATIO]]
+
+        # 3. 結合と重複排除（変数をインライン化して削減）
+        merged_df = pd.concat([auto_df, manual_df], ignore_index=True)
+        merged_df = merged_df.drop_duplicates(subset=["店コード", "従業員コード", "分類"], keep="last")
+
+    except Exception:
+        _logger.exception("手動設定CSVの処理中に予期せぬエラーが発生しました。自動抽出リストで続行します。")
+        return auto_df
+
+    _logger.info("手動設定リスト(バリデーション済)を対象者リストにマージしました。")
+    return merged_df
+
+
+def create_overwrite_df(tt_raw: pd.DataFrame, output_task_ratio_flag: bool = False) -> pd.DataFrame:
+    """固定ポジション対象者リストを作成する
+
+    Parameters
+    ----------
+    tt_raw : pd.DataFrame
+        TTのデータフレーム。
+    output_task_ratio_flag : bool
+        ポジション割合のリスト（閾値による除外前）を出力するか否かのフラグ。
+
+    Returns
+    -------
+    pd.DataFrame
+        固定ポジション対象者が抽出されたデータフレーム。
+    """
+    tt = tt_raw.copy()
+    tt = exclude_unnecessary(tt, _POS)
+
+    common_event = load_common_event()
+    # 対象タスク一覧
+    tasks = config.TASKS_TO_OVERWRITE
+    # 閾値
+    minimum_count = config.MINIMUM_COUNT_TO_OVERWRITE
+    ratio_threshold = config.THRESHOLD_TO_OVERWRITE
+
+    tt = add_date_category(tt, common_event)
+    df_task_ratio = pd.concat([calc_task_ratio(tt, task) for task in tasks], ignore_index=True).sort_values([
+        _SHOP_CODE,
+        _EMPLOYEE_CODE,
+        _POSITION,
+        _DATE_CATEGORY,
+    ])
+    if output_task_ratio_flag:
+        today = datetime.date.today().strftime("%Y%m%d")
+        output_dir = os.path.join(config.OUTPUT_DIR, f"./evaluation/{today}/")
+        min_date = pd.to_datetime(tt[_DATE_COLUMN]).min().strftime("%Y%m%d")
+        max_date = pd.to_datetime(tt[_DATE_COLUMN]).max().strftime("%Y%m%d")
+        output_filename = os.path.join(output_dir, f"task_ratio_from_{min_date}_to_{max_date}.csv")
+        os.makedirs(output_dir, exist_ok=True)
+        df_task_ratio.to_csv(output_filename, index=False, encoding="cp932")
+        _logger.info("%s を出力しました。", output_filename)
+
+    return df_task_ratio[
+        (df_task_ratio[_COUNT_TOTAL] >= minimum_count) & (df_task_ratio[_TASK_RATIO] >= ratio_threshold)
+    ]
+
+
+def exclude_unnecessary(tt: pd.DataFrame, position_list: list[str]) -> pd.DataFrame:
+    """TTから実働ポジションの行のみを残す。
+
+    Parameters
+    ----------
+    tt : pd.DataFrame
+        TTのデータフレーム。
+    position_list : list[str]
+        実働ポジションのリスト。
+
+    Returns
+    -------
+    pd.DataFrame
+        実働ポジションのみとなったTTのデータフレーム。
+    """
+    pos_pattern = "|".join(position_list)
+    pos_set_before = set(tt[_POSITION_IN_PREPROCESS_FILE].unique())
+    _logger.debug("実働ポジション除外前の行数: %s", tt.shape[0])
+    tt = tt[tt[_POSITION_IN_PREPROCESS_FILE].str.contains(pos_pattern, na=False)]
+    _logger.debug("実働ポジション除外後の行数: %s", tt.shape[0])
+    _logger.debug("実働ポジション除外後の役割差分 %s", pos_set_before - set(tt[_POSITION_IN_PREPROCESS_FILE].unique()))
+    return tt
+
+
+def add_date_category(df_raw: pd.DataFrame, common_event: pd.DataFrame) -> pd.DataFrame:
+    """データフレームに日付カテゴリ（平日/土日祝）列を追加する。
+
+    土日祝の条件:
+    1. 全店共通イベントに含まれる日付
+    2. 暦上の土曜日または日曜日
+
+    Parameters
+    ----------
+    df_raw: pd.DataFrame
+        処理対象のTTデータフレーム。_DATE_COLUMN を含む。
+    common_event: pd.DataFrame
+        全店共通イベント。_EVENT_DATE を含む。
+
+    Returns
+    -------
+    pd.DataFrame:
+        _DATE_CATEGORY列が追加されたデータフレーム。
+    """
+    df = df_raw.copy()
+    main_dates = pd.to_datetime(df[_DATE_COLUMN], format="%Y%m%d", errors="coerce")
+    event_dates_set = set(pd.to_datetime(common_event[_EVENT_DATE]).dropna())
+
+    is_event = main_dates.isin(event_dates_set)
+    is_weekend = main_dates.dt.dayofweek.isin([5, 6])  # 5:土曜, 6:日曜
+
+    df[_DATE_CATEGORY] = np.where(
+        is_event | is_weekend,  # OR条件
+        "土日祝",  # True の場合
+        "平日",  # False の場合
+    )
+    return df
+
+
+def calc_task_ratio(df_raw: pd.DataFrame, task_column: str) -> pd.DataFrame:
+    """指定したポジションの割合を算出する。
+
+    Parameters
+    ----------
+    df_raw: pd.DataFrame
+        処理対象のTTデータフレーム。
+    task_column: str
+        割合算出対象のポジション。
+
+    Returns
+    -------
+        pd.DataFrame: ポジション割合が追加されたDataFrame。
+    """
+    schema_overrides = dict.fromkeys(df_raw.columns, pl.String)
+    df = pl.from_pandas(df_raw, schema_overrides=schema_overrides)
+    df_gb = (
+        df.group_by([_EMPLOYEE_CODE, _SHOP_CODE, _DATE_CATEGORY])
+        .agg(
+            pl.lit(task_column).alias(_POSITION),
+            pl.len().alias(_COUNT_TOTAL),
+            pl.when(
+                pl.col(_POSITION_IN_PREPROCESS_FILE).str.contains(task_column)
+            )  # 役割が対象ポジションである場合にカウント
+            .then(1)
+            .otherwise(0)
+            .sum()
+            .alias(_COUNT_TASK),
+        )
+        .with_columns(
+            (pl.col(_COUNT_TASK) / pl.col(_COUNT_TOTAL)).alias(_TASK_RATIO),
+        )
+        .to_pandas()
+    )
+    return df_gb
+
+
+def load_common_event() -> pd.DataFrame:
+    """共通イベントを読み込む"""
+    common_event = Event(create_read_context(tt_config.COMMON_EVENT_DATA))._data
+    return common_event
+
+
+# いったんwriter.pyからコピー
+def _load_secret(secret_id: str) -> dict:
+    _logger.info("Secrets Managerからアカウント情報取得: SecretId='%s'", secret_id)
+    secretsmanager_client = boto3.client("secretsmanager")
+    value = secretsmanager_client.get_secret_value(SecretId=secret_id)
+    _logger.info("SecretManagerからの情報を使用してアップローダーを作成します: secret_name='%s'", secret_id)
+    try:
+        return json.loads(value["SecretString"])
+    except json.JSONDecodeError as e:
+        e.add_note(f"取得したシークレット文字列が不正なJSON形式です: SecretId='{secret_id}")
+        raise
+
+
+def main(begin: date | None = None, output_task_ratio_flag: bool = False) -> None:
+    parsed, _ = split_uri(config.SFTP_URL, _logger)
+    username = unquote(parsed.username)
+    overwrite = _load_secret(username)
+    hostname = overwrite.get("host", parsed.hostname)
+    username = overwrite.get("user", username)
+    port = int(overwrite.get("port", parsed.port or 22))
+    username = username or "anonymous"
+    password = overwrite.get("password", parsed.password)
+    private_key = overwrite.get("private_key", None)
+    passfrase = overwrite.get("passphrase", None)
+    host_key = overwrite.get("host_key", None)
+
+    # SFTPDownloaderクラスをインスタンス化
+    downloader = SFTPSyncer(
+        hostname=hostname,
+        port=port,
+        username=username,
+        private_key=private_key,
+        passphrase=passfrase,
+        password=password,
+        host_key=host_key,
+    )
+    sync_target = create_uploader(config.SYNC_TARGET)
+    sync_path = urlparse(config.SYNC_TARGET).path
+    # 差分ダウンロードメソッドを実行
+    new_files = downloader.transfer_new_zip_files(remote_dir=parsed.path, target=sync_target, upload_path=sync_path)
+
+    if new_files:
+        print("\n以下の新しいファイルがダウンロードされました：")
+        for f in new_files:
+            print(f"- {f}")
+    else:
+        print("\n新しいファイルはありませんでした。")
+
+    parquet_output = create_uploader(config.PARQUET_PATH)
+    input_target = create_read_context(config.PARQUET_PATH)
+    sync_target_read = create_read_context(config.SYNC_TARGET)
+
+    merge_files(
+        zip_source=sync_target_read,
+        output_location=parquet_output.location(),
+        input_location=input_target,
+    )
+    days_within = config.DAYS_WITHIN
+    required_columns = [
+        "従業員コード",
+        "店コード",
+        "日付",
+        "作業開始時間",
+        "作業終了時間",
+        "役割",
+        "資格",
+        "必須従業員区分",
+        *config.TASKS_TO_OVERWRITE,
+    ]
+
+    df = create_table_for_overwrite(
+        input_location=input_target,
+        days_within=days_within,
+        required_columns=required_columns,
+        start_date=begin,
+    )
+    upload_dataframe_as_csv(df, target=create_uploader(config.SAVE_CSV_DIR))
+    overwrite_all_df = create_overwrite_df(df, output_task_ratio_flag)
+
+    # 手動で設定した固定ポジションリストをマージして上書き対象者リストを完成させる
+    overwrite_all_df = merge_manual_settings(overwrite_all_df)
+
+    now = datetime.datetime.fromtimestamp(tt_config.BEGIN, tt_config.TZ)
+    target = create_uploader(config.SKILLED_POS_OUTPUT)
+    loc = target.location(now)
+    _logger.info("スキルチューニングを出力します。(%s)", loc)
+    with loc.mktemp_for_post() as temp_file:
+        overwrite_all_df.to_csv(temp_file.name, index=False, encoding="utf-8", storage_options=target.storage_options)
+        loc.post(temp_file)
+    _logger.info("スキルチューニングを完了しました。")
+
+
+if __name__ == "__main__":
+    if "-r" in sys.argv:
+        _logger.info("閾値による除外前のリストを出力します。")
+        main(output_task_ratio_flag=True)
+    setup_logging()
+    if 1 < len(sys.argv):
+        if 3 < len(sys.argv):
+            y = int(sys.argv[1])
+            m = int(sys.argv[2])
+            d = int(sys.argv[3])
+            begin = datetime.date(y, m, d)
+            _logger.info("開始日を %s と設定しました", begin)
+            main(begin)
+        else:
+            main()
+    else:
+        main()
