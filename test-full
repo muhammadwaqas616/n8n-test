@@ -1,0 +1,3 @@
+FROM_SNOWFLAKE = "/Users/pl/Downloads/2026-06-30/R202509/ee"
+SHIFTAI_INPUT_REPOSITORY = "/Users/pl/Downloads/2026-06-30/R202509/input"
+SHIFTAI_STORE_REPOSITORY = "/Users/pl/Downloads/2026-06-30/R202509/store"
